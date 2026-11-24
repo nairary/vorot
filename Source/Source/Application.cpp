@@ -1,0 +1,737 @@
+#include "Application.h"
+
+Application::Application(const int width, const int height)
+    : io(ImGuiIO{})
+{
+    temp_data.resize(DEFAULT_FFT_SIZE);
+    local_data.resize(DEFAULT_FFT_SIZE);
+    averaged_data.resize(DEFAULT_FFT_SIZE);
+    average_sum.resize(DEFAULT_FFT_SIZE);
+    if (!glfwInit())
+        throw std::runtime_error("GLFW runtime error");
+
+    const char* glsl_version = "#version 130";
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    // Create window with graphics context
+    float main_scale = ImGui_ImplGlfw_GetContentScaleForMonitor(glfwGetPrimaryMonitor()); // Valid on GLFW 3.3+ only
+    window = glfwCreateWindow((int)(width * main_scale), (int)(height * main_scale), "Vorot", nullptr, nullptr);
+    if (window == nullptr)
+        throw std::runtime_error("Creating window error");
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1); // Enable vsync
+
+    // Setup Dear ImGui context
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImPlot::CreateContext();
+    io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;         // Enable Docking
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;       // Enable Multi-Viewport / Platform Windows
+    //io.ConfigViewportsNoAutoMerge = true;
+    //io.ConfigViewportsNoTaskBarIcon = true;
+
+    // Setup Dear ImGui style
+    ImGui::StyleColorsDark();
+    //ImGui::StyleColorsLight();
+
+    // Setup scaling
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.ScaleAllSizes(main_scale);        // Bake a fixed style scale. (until we have a solution for dynamic style scaling, changing this requires resetting Style + calling this again)
+    style.FontScaleDpi = main_scale;        // Set initial font scale. (in docking branch: using io.ConfigDpiScaleFonts=true automatically overrides this for every window depending on the current monitor)
+
+    io.ConfigDpiScaleFonts = true;          // [Experimental] Automatically overwrite style.FontScaleDpi in Begin() when Monitor DPI changes. This will scale fonts but _NOT_ scale sizes/padding for now.
+    io.ConfigDpiScaleViewports = true;      // [Experimental] Scale Dear ImGui and Platform Windows when Monitor DPI changes.
+
+    // When viewports are enabled we tweak WindowRounding/WindowBg so platform windows can look identical to regular ones.
+    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+    {
+        style.WindowRounding = 0.0f;
+        style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+    }
+
+    // Setup Platform/Renderer backends
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init(glsl_version);
+
+    esp_receiver = std::make_unique<EspSdrReceiver>(monitor_parameters, 32);
+    esp_sampling_rates = { 0,1,2,3,4,5 };
+    esp_sampling_rates_MHz = {
+        "80 MHz",
+        "40 MHz",
+        "20 MHz",
+        "10 MHz",
+        "8 MHz",
+        "4 MHz"
+    };
+
+ }
+
+void Application::ShowPlot()
+{
+    bool show_demo_window = false;
+    ImPlot::ShowDemoWindow(&show_demo_window);
+}
+
+void Application::ShowUSRPInterface()
+{
+    ImGui::Begin("Spectrum Analysis");
+    {
+        ImGui::Begin("Receiver Parameters");
+        // Код для ESP-SDR;
+
+
+        if (!usrp_device_exists.load())
+        {
+            // Включаем приёмник
+            if (ImGui::Button("Turn on receiver"))
+            {
+                app_threads.push_back(std::jthread{ &Application::CreateUSRPDevice, this });
+            }
+        }
+        else
+        {
+            ImGui::Text("USRP device connected");
+            // Изменяем центральную частоту
+            ImGui::SliderScalar("Frequency, MHz", ImGuiDataType_Double, &current_frequency, &frequency_min, &frequency_max, "%.2f");
+            //ImGui::InputDouble("USRP Frequency, MHz", &current_frequency);
+            if (ImGui::IsItemDeactivatedAfterEdit())
+            {
+                usrp_device->SetFrequency(current_frequency);
+                ResetSpectrumAveraging();
+            }
+            ImGui::Text("Current Frequency: %.2f MHz", usrp_device->GetFrequency());
+
+            // Изменяем частоту дискретизации
+            if (sampling_rates_mhz.empty())
+            {
+                sampling_rates_mhz = usrp_device->GetAvailableSamplingRates();
+                for (int i = 0; i < static_cast<int>(sampling_rates_mhz.size()); ++i)
+                {
+                    if (sampling_rates_mhz[i] >= usrp_device->GetSamplingRate())
+                    {
+                        selected_sampling_rate_index = i;
+                        break;
+                    }
+                }
+            }
+
+            if (!sampling_rates_mhz.empty())
+            {
+                char sampling_rate_label[32];
+                snprintf(sampling_rate_label, sizeof(sampling_rate_label), "%.3f MHz", sampling_rates_mhz[selected_sampling_rate_index]);
+                if (ImGui::BeginCombo("Sampling rate", sampling_rate_label))
+                {
+                    for (int i = 0; i < static_cast<int>(sampling_rates_mhz.size()); ++i)
+                    {
+                        const bool is_selected = (selected_sampling_rate_index == i);
+                        char item_label[32];
+                        snprintf(item_label, sizeof(item_label), "%.3f MHz", sampling_rates_mhz[i]);
+                        if (ImGui::Selectable(item_label, is_selected))
+                        {
+                            selected_sampling_rate_index = i;
+                            usrp_device->SetSamplingRate(sampling_rates_mhz[i]);
+                            ResetSpectrumAveraging();
+                        }
+                        if (is_selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::Text("Current sampling rate: %.3f MHz", usrp_device->GetSamplingRate());
+            }
+
+            // Изменяем усиление приемника в дБ
+            ImGui::SliderScalar(
+                "RX gain",
+                ImGuiDataType_Double,
+                &current_rx_gain,
+                &rx_gain_min,
+                &rx_gain_max,
+                "%.1f dB"
+            );
+
+            if (ImGui::IsItemDeactivatedAfterEdit())
+            {
+                usrp_device->SetRXGain(current_rx_gain);
+            }
+            ImGui::Text("Current RX gain: %.1f dB", usrp_device->GetRXGain());
+
+            ImGui::BeginDisabled(usrp_device->IsStreaming());
+            char fft_size_label[32];
+            snprintf(fft_size_label, sizeof(fft_size_label), "2^%d (%zu)", selected_fft_exponent,
+                size_t{1} << selected_fft_exponent);
+            if (ImGui::BeginCombo("FFT points", fft_size_label))
+            {
+                for (int exponent = MIN_FFT_EXPONENT; exponent <= MAX_FFT_EXPONENT; ++exponent)
+                {
+                    const bool is_selected = selected_fft_exponent == exponent;
+                    char item_label[32];
+                    snprintf(item_label, sizeof(item_label), "2^%d (%zu)", exponent, size_t{1} << exponent);
+                    if (ImGui::Selectable(item_label, is_selected))
+                    {
+                        const size_t fft_size = size_t{1} << exponent;
+                        usrp_device->SetFFTSize(fft_size);
+                        selected_fft_exponent = exponent;
+                        std::lock_guard lock(receiver_mutex);
+                        temp_data.assign(fft_size, 0.0f);
+                        local_data.assign(fft_size, 0.0f);
+                        averaged_data.assign(fft_size, 0.0f);
+                        average_sum.assign(fft_size, 0.0f);
+                        ResetSpectrumAveraging();
+                    }
+                    if (is_selected)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::EndDisabled();
+            if (usrp_device->IsStreaming())
+                ImGui::TextDisabled("Stop the stream to change the FFT size");
+
+        }
+
+        ImGui::End();
+        if (usrp_device_exists.load())
+        {
+            // Логика, контролирующая стрим данных
+            // wifi часть
+            const auto wifi = usrp_device->GetWiFiStatus();
+            bool enabled = wifi.enabled;
+            const bool supported = std::abs(usrp_device->GetSamplingRate() * 1e6 - 20e6) <= 20;
+            ImGui::Checkbox("Turn on Wi-Fi detection", &wifi_receive_mode);
+            ImGui::SeparatorText("Wi-Fi L-STF detection");
+            ImGui::BeginDisabled(!supported);
+            if (ImGui::Checkbox("Enable Wi-Fi detection", &enabled)) usrp_device->WiFiEnable(enabled);
+            ImGui::EndDisabled();
+            if (!supported) ImGui::TextDisabled("Requires actual RX rate of 20 MS/s");
+
+
+            if (!usrp_device->IsStreaming())
+            {
+                if (ImGui::Button("Start stream"))
+                {
+                    usrp_device->StartStream();
+                    app_threads.push_back(std::jthread{ &Application::GetAndRenderStreamingData, this });
+                }
+            }
+            else
+            {
+                auto freq = usrp_device->GetFrequency() * 1e6;
+                auto fd = usrp_device->GetSamplingRate() * 1e6;
+                const double max_spectrum_display_width_khz = fd / 2e3;
+                if (spectrum_display_width_khz < 0.0 || spectrum_display_width_khz > max_spectrum_display_width_khz)
+                    spectrum_display_width_khz = max_spectrum_display_width_khz;
+                ImGui::Text("Im streaming");
+                //std::cout << (std::to_string(local_data[0]).c_str()) << "\n";
+                ImGui::Checkbox("Marker To Peak", &enable_marker);
+                ImGui::Checkbox("Average spectrum over time", &average_spectrum_enabled);
+                ImGui::BeginDisabled(!average_spectrum_enabled);
+                if (ImGui::SliderFloat("Averaging time, s", &average_time_seconds, 0.1f, 30.0f, "%.1f"))
+                    ResetSpectrumAveraging();
+                ImGui::EndDisabled();
+
+                ImGui::SeparatorText("IQ recording");
+                ImGui::SliderFloat("Recording time, s", &recording_time_seconds, 0.1f, 10.0f, "%.1f");
+                ImGui::BeginDisabled(usrp_device->IsRecording());
+                if (ImGui::Button("Record raw IQ"))
+                    usrp_device->StartRecording(recording_time_seconds);
+                ImGui::EndDisabled();
+                if (usrp_device->IsRecording())
+                    ImGui::Text("Recording raw IQ...");
+                else if (!usrp_device->GetLastRecordingBasePath().empty())
+                    ImGui::Text("Last recording: %s", usrp_device->GetLastRecordingBasePath().string().c_str());
+                UpdateSpectrumAveraging(local_data, fd);
+
+                ImGui::Checkbox("Low Frequency Spectrum", &enable_low_frequency_spectrum);
+                // Отрисовка спектра
+                ImGui::Begin("Spectrum Plot");
+                    //const double spectrum_display_width_min_khz = 0.0;
+                    //ImGui::SliderScalar(
+                    //    "Spectrum display half-width, kHz",
+                    //    ImGuiDataType_Double,
+                    //    &spectrum_display_width_khz,
+                    //    &spectrum_display_width_min_khz,
+                    //    &max_spectrum_display_width_khz,
+                    //    "%.1f"
+                    //);
+                    FFTPlot(GetSpectrumForPlot(), freq, fd, enable_low_frequency_spectrum, current_rx_gain, enable_marker);
+                ImGui::End();
+
+                if (ImGui::Button("Stop stream"))
+                {
+                    usrp_device->StopStream();
+                    app_threads.pop_back();
+                }
+
+                // ещё одна wifi часть
+                if (!wifi.recent.empty()) {
+                    const auto& last = wifi.recent.back();
+                    ImGui::Text("Latest score %.3f; coarse CFO %.1f Hz", last.correlation, last.cfo_hz);
+                }
+                ImGui::Text("L-LTF confirmed: %llu; rejected: %llu", static_cast<unsigned long long>(wifi.synchronized_packets), static_cast<unsigned long long>(wifi.rejected_candidates));
+                if (!wifi.recent_sync.empty()) 
+                {
+                    const auto& sync = wifi.recent_sync.back();
+                    ImGui::Text("LTF1: %llu; inferred start: %llu; total CFO: %.1f Hz", static_cast<unsigned long long>(sync.ltf_first_index), static_cast<unsigned long long>(sync.packet_start_index), sync.total_cfo_hz);
+                    
+                    if (sync.lsig_result.valid)
+                    {
+                        ImGui::Text("L-SIG decoded successfully");
+                        ImGui::Text("RATE: %u Mbps",
+                            sync.lsig_result.rate_mbps);
+                        ImGui::Text("LENGTH: %u",
+                            sync.lsig_result.length_bytes);
+                    }
+                    else
+                    {
+                        ImGui::Text("L-SIG decoding failed: %s",
+                            sync.lsig_result.error.c_str());
+                        ImGui::Text("");
+                        ImGui::Text("");
+                    }
+
+                        ImGui::Text("Parameters of wi-fi channel");
+                        ImGui::Text(sync.lsig_result.channel_parameters.c_str());
+
+                        if (!wifi.recent_ht.empty())
+                        {
+                            const auto& htsig_event = wifi.recent_ht.back();
+                            ImGui::Text("Info from HT_SIG");
+                            ImGui::Text("MCS: %u", static_cast<unsigned>(htsig_event.signal.mcs));
+                            if (htsig_event.signal.cbw40)
+                                ImGui::Text("Real bandwidth 40 MS/s");
+                            else
+                                ImGui::Text("Real bandwidth 20 MS/s");
+
+                            ImGui::Text("Length in bytes: %u", htsig_event.signal.length_bytes);
+
+                        }
+                    //}
+                }
+
+                
+            }
+        }
+    }
+    ImGui::End();
+}
+
+void Application::ShowESPReceiverInterface()
+{
+    ImGui::Begin("ESP_SDR interface");
+    if (esp_receiver)
+    {
+        ImGui::Text("ESP-SDR Receiver controls");
+        if (!esp_receiver->isConnected())
+        {
+            if (ImGui::Button("Connect to ESP-SDR"))
+            {
+                if (!esp_receiver->connect("COM4"))
+                    std::cout << esp_receiver->lastError() << std::endl;
+                esp_selected_sample_rate_index = esp_receiver->getSampleRate();
+            }
+        }
+        else
+        {
+            // Выбор центральной частоты 
+            static int old_frequency = esp_current_frequency;
+            ImGui::SliderInt("Frequency, MHz:", &old_frequency, 100, 6000);
+            changeWithMouseWheel(old_frequency, 1.0);
+
+            // Выбор ширины полосы
+            static int old_bandwidth = esp_current_bandwidth;
+            ImGui::SliderInt("Bandwidth, MHz:", &old_bandwidth, 11, 48);
+            changeWithMouseWheel(old_bandwidth, 1.0);
+
+            // Выбор коэффициента усиления
+            static int old_gain = esp_current_gain;
+            ImGui::SliderInt("Gain, dB:", &old_gain, 0, 81);
+            changeWithMouseWheel(old_gain, 1.0);
+
+            static int old_regime = esp_current_regime;
+            static int option = 0;
+            ImGui::RadioButton("FFT", &option, 0);
+            ImGui::RadioButton("Image", &option, 1);
+            if (option == 0)
+                old_regime = 0;
+            else
+                old_regime = 1;
+
+            if ((static_cast<uint32_t>(old_bandwidth) != esp_current_bandwidth) ||
+                (static_cast<uint32_t>(old_frequency)!=esp_current_frequency) ||
+                (static_cast<uint32_t>(old_gain) != esp_current_gain) ||
+                old_regime != esp_current_regime
+                )
+            {
+                ResetSpectrumAveraging();
+                bool was_streaming = esp_receiver->isStreaming();
+                if (was_streaming)
+                {
+                    EspStopStream();
+                }
+
+                esp_current_bandwidth = static_cast<uint32_t>(old_bandwidth);
+                esp_receiver->setBandwidth(esp_current_bandwidth);
+                esp_current_frequency = static_cast<uint32_t>(old_frequency);
+                esp_receiver->setFrequency(esp_current_frequency);
+                esp_current_gain = static_cast<uint32_t>(old_gain);
+                esp_receiver->setManualGain(esp_current_gain);
+                esp_current_regime = old_regime;
+
+                if (was_streaming)
+                {
+                    EspStartStream();
+                }
+            }
+            // Усреднение спектра
+            ImGui::Checkbox("Average spectrum over time", &average_spectrum_enabled);
+            // Выбор частоты дискретизации
+
+            if (ImGui::BeginCombo("Sampling rate", esp_sampling_rates_MHz[esp_selected_sample_rate_index].c_str()))
+            {
+                for (int i = 0; i < static_cast<int>(esp_sampling_rates_MHz.size()); ++i)
+                {
+                    const bool is_selected = (esp_selected_sample_rate_index == i);
+                    if (ImGui::Selectable(esp_sampling_rates_MHz[i].c_str(), is_selected))
+                    {
+                        esp_selected_sample_rate_index = i;
+                        esp_receiver->setSampleRate(esp_sampling_rates[esp_selected_sample_rate_index]);
+                        ResetSpectrumAveraging();
+                    }
+                    if (is_selected)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            
+            if (!esp_receiver->isStreaming())
+            {
+                std::string esp_sdr_info = esp_receiver->getInfo();
+                ImGui::Text(esp_sdr_info.c_str());
+
+                std::string esp_sdr_limits = esp_receiver->getLimits();
+                ImGui::Text("\n");
+                ImGui::Text(esp_sdr_limits.c_str());
+
+                if (ImGui::Button("Start stream"))
+                {
+                    EspStartStream();
+                }
+            }
+            else
+            {
+                uint32_t fd_index = esp_receiver->getSampleRate();
+                double fd = esp_receiver->sampleRate(fd_index);
+                double f_c_hz = esp_current_frequency * 1e6;
+                UpdateSpectrumAveraging(local_data, fd);
+                ImGui::Begin("Spectrum Plot");
+                
+                FFTPlot(GetSpectrumForPlot(), f_c_hz, fd, false, 0.0, false);
+                ImGui::End();
+
+                if (ImGui::Button("Stop stream"))
+                {
+                    EspStopStream();
+                }
+
+                // Отображение картинки
+                ImGui::Begin("Real Time Image");
+                try
+                {
+                    if (esp_current_regime == 1)
+                    {
+                        if (is_texture_ready.load())
+                        {
+                            real_time_texture_id = CreateTextureFromCVMat(local_image, 2200, 1125);
+                            
+                            is_texture_ready.store(false);
+                        }
+                        ImVec2 size = ImGui::GetContentRegionAvail();
+                        ImGui::Image((ImTextureID)(intptr_t)real_time_texture_id, size);
+                    }
+                }
+                catch (std::exception& e)
+                {
+                    std::cout << e.what() << "\n";
+                }
+                ImGui::End();
+            }
+
+            if (ImGui::Button("Disconnect ESP-SDR"))
+            {
+                esp_receiver->disconnect();
+            }
+        }
+                
+    }
+    ImGui::End();
+}
+
+void Application::EspStopStream()
+{
+    esp_receiver->stopStream();
+    for (auto& thread : app_threads)
+    {
+        if (thread.joinable())
+            thread.join();
+    }
+}
+
+void Application::EspStartStream()
+{
+    esp_receiver->startStream();
+    app_threads.push_back(std::jthread{ &Application::GetAndRenderESPData, this });
+}
+
+void Application::CreateUSRPDevice()
+{
+    bool result;
+    usrp_device = std::make_unique<USRPDevice>(result);
+    usrp_device_exists.store(result);
+    return;
+}
+
+void Application::GetAndRenderStreamingData()
+{
+    if (wifi_receive_mode)
+    {
+        std::jthread jth(&USRPDevice::GetWiFiData, usrp_device.get(), std::ref(temp_data), std::ref(is_data_ready), std::ref(receiver_mutex));
+    }
+    else
+    {
+        std::jthread jth(&USRPDevice::GetUSRPData, usrp_device.get(), std::ref(temp_data), std::ref(is_data_ready), std::ref(receiver_mutex));
+        while (usrp_device->IsStreaming())
+        {
+            std::lock_guard lock(receiver_mutex);
+            if (is_data_ready.load())
+            {
+                local_data = temp_data;
+                data_sequence.fetch_add(1, std::memory_order_relaxed);
+                is_data_ready.store(false);
+            }
+        }
+    }
+    
+}
+
+void Application::GetAndRenderESPData()
+{
+    if (esp_current_regime == 0)
+    {
+        std::jthread jth(&EspSdrReceiver::StreamIQData, esp_receiver.get(), std::ref(temp_data), std::ref(is_data_ready), std::ref(receiver_mutex));
+        while (esp_receiver->isStreaming())
+        {
+            std::lock_guard lock(receiver_mutex);
+            if (is_data_ready.load())
+            {
+                local_data = temp_data;
+                data_sequence.fetch_add(1, std::memory_order_relaxed);
+                is_data_ready.store(false);
+            }
+        }
+    }
+    else if (esp_current_regime == 1)
+    {
+        std::jthread jth(&EspSdrReceiver::StreamImages, esp_receiver.get(), std::ref(tmp_image), std::ref(is_image_ready), std::ref(receiver_mutex));
+        while (esp_receiver->isStreaming())
+        {
+            std::lock_guard lock(receiver_mutex);
+            if (is_image_ready.load())
+            {
+                local_image = tmp_image;
+                is_texture_ready.store(true);
+                data_sequence.fetch_add(1, std::memory_order_relaxed);
+                is_image_ready.store(false);
+            }
+        }
+    }
+}
+
+void Application::ResetSpectrumAveraging()
+{
+    average_history.clear();
+    std::fill(average_sum.begin(), average_sum.end(), 0.0f);
+    std::fill(averaged_data.begin(), averaged_data.end(), 0.0f);
+    last_averaged_sequence = data_sequence.load(std::memory_order_relaxed);
+}
+
+void Application::UpdateSpectrumAveraging(const std::vector<float>& spectrum, double sampling_rate_hz)
+{
+    const uint64_t sequence = data_sequence.load(std::memory_order_relaxed);
+    if (!average_spectrum_enabled || sequence == last_averaged_sequence || spectrum.empty())
+        return;
+
+    if (average_sum.size() != spectrum.size())
+    {
+        average_sum.assign(spectrum.size(), 0.0f);
+        averaged_data.assign(spectrum.size(), 0.0f);
+        average_history.clear();
+    }
+
+    const double block_duration_seconds = static_cast<double>(spectrum.size()) / sampling_rate_hz;
+    const size_t max_blocks = std::max<size_t>(1, static_cast<size_t>(std::ceil(average_time_seconds / block_duration_seconds)));
+
+    average_history.push_back(spectrum);
+    for (size_t i = 0; i < spectrum.size(); ++i)
+        average_sum[i] += spectrum[i];
+
+    while (average_history.size() > max_blocks)
+    {
+        const auto& oldest = average_history.front();
+        for (size_t i = 0; i < oldest.size(); ++i)
+            average_sum[i] -= oldest[i];
+        average_history.pop_front();
+    }
+
+    const float scale = 1.0f / static_cast<float>(average_history.size());
+    for (size_t i = 0; i < average_sum.size(); ++i)
+        averaged_data[i] = average_sum[i] * scale;
+
+    last_averaged_sequence = sequence;
+}
+
+const std::vector<float>& Application::GetSpectrumForPlot() const
+{
+    return average_spectrum_enabled && !average_history.empty() ? averaged_data : local_data;
+}
+
+GLuint Application::CreateTextureFromCVMat(cv::Mat& texture, const int hor, const int ver)
+{
+   
+ //   if (texture.ptr() != nullptr)
+    
+       // if (real_time_texture_id == GL_INVALID_VALUE || real_time_texture_id == current_texture)
+       // if (real_time_texture_id == GL_INVALID_VALUE )
+        GLuint textureID = (real_time_texture_id == GL_INVALID_VALUE) ? 0 : real_time_texture_id;
+        if (real_time_texture_id != textureID)
+            glGenTextures(1, &textureID);
+
+        glBindTexture(GL_TEXTURE_2D, textureID);
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+        glPixelStorei(GL_UNPACK_ALIGNMENT, (texture.step & 3) ? 1 : 4);
+        GLenum inputFormat = GL_RGB;
+        if (texture.channels() == 1)
+        {
+            inputFormat = GL_RED;
+        }
+        else if (texture.channels() == 4)
+        {
+            inputFormat = GL_RGBA;
+        }
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, texture.cols, texture.rows, 0, inputFormat, GL_UNSIGNED_BYTE, texture.ptr());
+
+        glBindTexture(GL_TEXTURE_2D, 0);
+        // Установка параметров фильтрации текстуры
+        
+    
+  //  else
+    {
+        // Обработка ошибки изображения
+       /* std::string message = "Error during texture creation";
+        throw std::runtime_error(message);
+        real_time_texture_id = GL_INVALID_VALUE;
+        return;*/
+    }
+    return textureID;
+}
+
+void Application::Run()
+{
+    bool docking_interface = true;
+    bool show_demo_window = false;
+    bool show_another_window = false;
+    ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
+    ImGuiIO& current_io = ImGui::GetIO();
+    current_io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    while (!glfwWindowShouldClose(window))
+    {
+
+        // Poll and handle events (inputs, window resize, etc.)
+        // You can read the io.WantCaptureMouse, io.WantCaptureKeyboard flags to tell if dear imgui wants to use your inputs.
+        // - When io.WantCaptureMouse is true, do not dispatch mouse input data to your main application, or clear/overwrite your copy of the mouse data.
+        // - When io.WantCaptureKeyboard is true, do not dispatch keyboard input data to your main application, or clear/overwrite your copy of the keyboard data.
+        // Generally you may always pass all inputs to dear imgui, and hide them from your application based on those two flags.
+        glfwPollEvents();
+        if (glfwGetWindowAttrib(window, GLFW_ICONIFIED) != 0)
+        {
+            ImGui_ImplGlfw_Sleep(10);
+            continue;
+        }
+
+        // Start the Dear ImGui frame
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+        ImGui::DockSpaceOverViewport();
+        // 1. Show the big demo window (Most of the sample code is in ImGui::ShowDemoWindow()! You can browse its code to learn more about Dear ImGui!).
+        if (show_demo_window)
+            ImGui::ShowDemoWindow(&show_demo_window);
+
+        // 3. Show another simple window.
+        if (show_another_window)
+        {
+            ShowPlot();
+        }
+        ShowESPReceiverInterface();
+        ShowUSRPInterface();
+        // Rendering
+        ImGui::Render();
+        int display_w, display_h;
+        glfwGetFramebufferSize(window, &display_w, &display_h);
+        glViewport(0, 0, display_w, display_h);
+        glClearColor(clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // Update and Render additional Platform Windows
+        // (Platform functions may change the current OpenGL context, so we save/restore it to make it easier to paste this code elsewhere.
+        //  For this specific demo app we could also call glfwMakeContextCurrent(window) directly)
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+        {
+            GLFWwindow* backup_current_context = glfwGetCurrentContext();
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+            glfwMakeContextCurrent(backup_current_context);
+        }
+
+        glfwSwapBuffers(window);
+    }
+}
+
+
+Application::~Application()
+{
+
+    // Cleanup
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImPlot::DestroyContext();
+    ImGui::DestroyContext();
+
+    glfwDestroyWindow(window);
+    glfwTerminate();
+}
+
+void Application::ESPShowRealTimeImage()
+{
+    
+    // Если никакой текстуры не создано, то отображаем заглушку
+  /*  auto esp_texture_id = esp_receiver->image_processor_->get_texture_id();
+    if (esp_texture_id == GL_INVALID_VALUE)
+        return;
+    if (!is_image_ready.load())
+    {
+        std::lock_guard lock(texture_mutex);
+        CreateTextureFromCVMat(local_image, 2200, 1125);
+        esp_receiver->image_processor_->set_creation_condition();
+    }*/
+    
+    
+}
+
