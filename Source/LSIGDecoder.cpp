@@ -40,7 +40,8 @@ LSigResult LSIGDecoder::decode(std::span<const std::complex<double>> iq, double 
 
     for (size_t i = 0; i < 208; ++i)
     {
-        if (!std::isfinite(iq[i].real() || !std::isfinite(iq[i].imag())))
+        if (!std::isfinite(iq[i].real()) ||
+            !std::isfinite(iq[i].imag()))
         {
             result.error = "Non-finite IQ sample";
             return result;

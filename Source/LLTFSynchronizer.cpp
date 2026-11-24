@@ -87,14 +87,16 @@ std::vector<LLTFSyncEvent> LLTFSynchronizer::process(uint64_t segment, uint64_t&
 				lsig
 			}
 		);
-
-		pending_ht_.push_back(
-			{
-				segment,
-				bestIndex,
-				event.cfo_hz + fine
-			}
-		);
+		if (lsig.valid && lsig.rate_mbps == 6)
+		{
+			pending_ht_.push_back(
+				{
+					segment,
+					bestIndex,
+					event.cfo_hz + fine
+				}
+			);
+		}
 	}
 
 	while (!pending_ht_.empty())
@@ -155,7 +157,8 @@ double LLTFSynchronizer::match(uint64_t index, double cfo) const
 		power += std::norm(x);
 		phase *= step;
 	}
-	return power > 1e-20 ? std::clamp(std::norm(r) / power * (52.0 / 64), 0.0, 1.0) : 0;
+
+	return power > 1e-20 ? std::clamp(std::norm(r) / power / (52.0 / 64), 0.0, 1.0) : 0;
 }
 
 double LLTFSynchronizer::repeatScore(uint64_t a, uint64_t b, size_t count) const

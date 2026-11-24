@@ -276,8 +276,23 @@ void Application::ShowUSRPInterface()
                 {
                     const auto& sync = wifi.recent_sync.back();
                     ImGui::Text("LTF1: %llu; inferred start: %llu; total CFO: %.1f Hz", static_cast<unsigned long long>(sync.ltf_first_index), static_cast<unsigned long long>(sync.packet_start_index), sync.total_cfo_hz);
-                    /*if (sync.lsig_result.valid)
-                    {*/
+                    
+                    if (sync.lsig_result.valid)
+                    {
+                        ImGui::Text("L-SIG decoded successfully");
+                        ImGui::Text("RATE: %u Mbps",
+                            sync.lsig_result.rate_mbps);
+                        ImGui::Text("LENGTH: %u",
+                            sync.lsig_result.length_bytes);
+                    }
+                    else
+                    {
+                        ImGui::Text("L-SIG decoding failed: %s",
+                            sync.lsig_result.error.c_str());
+                        ImGui::Text("");
+                        ImGui::Text("");
+                    }
+
                         ImGui::Text("Parameters of wi-fi channel");
                         ImGui::Text(sync.lsig_result.channel_parameters.c_str());
 

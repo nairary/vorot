@@ -5,6 +5,7 @@
 #include <array>
 #include <vector>
 #include <numbers>
+#include <iostream>
 #include <algorithm>
 #include "LStfDetector.h"
 #include "LSIGDecoder.h"

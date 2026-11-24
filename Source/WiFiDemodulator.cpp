@@ -168,15 +168,6 @@ void WiFiDemodulator::run()
 					state_.processed_samples += block.samples.size();
 					state_.rejected_candidates += rejected;
 
-					// обработка lltf событий
-					for (auto event : synced)
-					{
-						++state_.synchronized_packets;
-						state_.recent_sync.push_back(event);
-						if (state_.recent_sync.size() > 8)
-							state_.recent_sync.erase(state_.recent_sync.begin());
-					}
-
 					// обработка lstf событий
 					for (auto event : events)
 					{
@@ -184,6 +175,15 @@ void WiFiDemodulator::run()
 						++state_.candidates;
 						state_.recent.push_back(event);
 						if (state_.recent.size() > 8) state_.recent.erase(state_.recent.begin());
+					}
+
+					// обработка lltf событий
+					for (auto event : synced)
+					{
+						++state_.synchronized_packets;
+						state_.recent_sync.push_back(event);
+						if (state_.recent_sync.size() > 8)
+							state_.recent_sync.erase(state_.recent_sync.begin());
 					}
 
 					// обработка ht-sig событий
