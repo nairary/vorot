@@ -1,5 +1,9 @@
 #include "WiFiDemodulator.h"
 
+#include <algorithm>
+#include <iostream>
+#include <iterator>
+
 std::vector<uint8_t> demodulate_bpsk(const std::vector<std::complex<float>>& subcarriers)
 {
 	std::vector<uint8_t> bits;
@@ -83,129 +87,260 @@ void process_phy_demodulation(const std::vector<std::complex<int16_t>>& iq_buffe
 	std::cout << "..." << std::endl;
 }
 
-WiFiDemodulator::WiFiDemodulator(const size_t capacity) : queue_(capacity), worker_([this] {run();}) {}
+namespace {
 
-WiFiDemodulator::~WiFiDemodulator() { queue_.close(); worker_.join(); }
+constexpr size_t diagnostic_history_limit = 8;
 
-// Пока эта функция жестко лочит нас на 20 МГц
+template<class T>
+void appendHistory(std::vector<T>& history, std::vector<T>& events, size_t limit = diagnostic_history_limit)
+{
+    const size_t incoming = std::min(events.size(), limit);
+    const size_t available = limit - incoming;
+    if (history.size() > available)
+        history.erase(history.begin(), history.end() - static_cast<std::ptrdiff_t>(available));
+    history.insert(history.end(), std::make_move_iterator(events.end() - static_cast<std::ptrdiff_t>(incoming)),
+                   std::make_move_iterator(events.end()));
+}
+
+}
+
+WiFiDemodulator::WiFiDemodulator(size_t capacity) : queue_(capacity), worker_([this] { run(); }) {}
+
+WiFiDemodulator::~WiFiDemodulator()
+{
+    queue_.close();
+    worker_.join();
+}
+
 void WiFiDemodulator::enable(bool enabled, double rate)
 {
-	std::lock_guard lock(mutex_);
-	state_.enabled = enabled && std::isfinite(rate) && std::abs(rate - 20e6) <= 20;
-	++generation_;
-	state_.recent.clear();
-	state_.recent_ht.clear();
-	state_.error.clear();
+    std::lock_guard lock(mutex_);
+    state_.enabled = enabled && std::isfinite(rate) && std::abs(rate - wifi::sample_rate_hz) <= 20;
+    ++generation_;
+    state_.recent.clear();
+    state_.recent_sync.clear();
+    state_.recent_ht.clear();
+    state_.recent_frames.clear();
+    state_.recent_diagnostics.clear();
+    state_.error = enabled && !state_.enabled ? "Wi-Fi OFDM requires a 20 MS/s RX rate" : "";
 }
 
 void WiFiDemodulator::submit(std::span<const std::complex<int16_t>> samples, uint64_t first, uint64_t segment, bool gap)
 {
-	std::lock_guard lock(mutex_);
-	if (state_.enabled)
-		queue_.push(samples, first, segment, gap, generation_);
+    std::lock_guard lock(mutex_);
+    if (state_.enabled)
+        queue_.push(samples, first, segment, gap, generation_);
 }
 
 WiFiDemodulator::Snapshot WiFiDemodulator::snapshot() const
 {
-	std::lock_guard lock(mutex_);
-	auto result = state_;
-	result.queue = queue_.stats();
-	return result;
+    std::lock_guard lock(mutex_);
+    auto result = state_;
+    result.queue = queue_.stats();
+    return result;
 }
 
-// Пока здесь только поиск LSTF
 void WiFiDemodulator::run()
 {
-	LStfDetector detector;
-	LLTFSynchronizer synchronizer(htsig_decoder_);
+    uint64_t generation = ~uint64_t{0};
+    uint64_t segment = ~uint64_t{0};
+    uint64_t next = 0;
+    IqBlock block;
+    while (queue_.pop(block))
+    {
+        {
+            std::lock_guard lock(mutex_);
+            if (!state_.enabled || block.token != generation_)
+                continue;
+        }
 
-	uint64_t generation = ~uint64_t{ 0 };
-	uint64_t segment = ~uint64_t{ 0 };
-	uint64_t next = 0;
+        try
+        {
+            Snapshot batch;
+            if (block.token != generation || block.segment != segment || block.first != next || block.discontinuity)
+            {
+                if (block.token == generation)
+                    for (const auto& packet : packets_)
+                        diagnose(packet, "IQ discontinuity interrupted the packet", batch);
+                detector_.reset(block.first);
+                synchronizer_.reset(block.first);
+                packets_.clear();
+                ++batch.resets;
+            }
 
-	IqBlock block;
-	
-	while (queue_.pop(block))
-	{
-		uint64_t current;
-		{
-			{
-				std::lock_guard lock(mutex_);
-				if (!state_.enabled || block.token != generation_) continue;
+            constexpr size_t chunk_size = 256;
+            const auto samples = std::span<const std::complex<int16_t>>(block.samples);
+            for (size_t offset = 0; offset < samples.size(); offset += chunk_size)
+                processPart(samples.subspan(offset, std::min(chunk_size, samples.size() - offset)), block.segment, batch);
+            batch.processed_samples = samples.size();
 
-				current = generation_;
-				// Если был разрыв, то запускаем детектор заново
-				if (current != generation || segment != block.segment || next != block.first || block.discontinuity)
-				{
-					detector.reset(block.first);
-					synchronizer.reset(block.first);
-					++state_.resets;
-				}
-			}
-			try
-			{
-				std::vector<LStfEvent> events;
-				std::vector<LLTFSyncEvent> synced;
-				std::vector<HtSigEvent> htsig_events;
-				uint64_t rejected = 0;
-				for (size_t offset = 0; offset < block.samples.size(); offset += 256)
-				{
-					const auto part = std::span(block.samples).subspan(offset, std::min<size_t>(256, block.samples.size() - offset));
-					synchronizer.append(part);
-					auto found = detector.process(part);
-					for (const auto& event : found)
-					{
-						synchronizer.candidate(event);
-					}
-					events.insert(events.end(), found.begin(), found.end());
-					auto results = synchronizer.process(block.segment, rejected, htsig_events);
-					synced.insert(synced.end(), results.begin(), results.end());
-				}
+            std::lock_guard lock(mutex_);
+            if (generation_ == block.token && state_.enabled)
+                publish(batch);
+        }
+        catch (const std::exception& e)
+        {
+            std::lock_guard lock(mutex_);
+            if (generation_ == block.token)
+            {
+                state_.error = e.what();
+                state_.enabled = false;
+            }
+        }
 
-				std::lock_guard lock(mutex_);
-				if (current == generation_ && state_.enabled)
-				{
-					state_.processed_samples += block.samples.size();
-					state_.rejected_candidates += rejected;
+        generation = block.token;
+        segment = block.segment;
+        next = block.first + block.samples.size();
+    }
+}
 
-					// обработка lstf событий
-					for (auto event : events)
-					{
-						event.segment = block.segment;
-						++state_.candidates;
-						state_.recent.push_back(event);
-						if (state_.recent.size() > 8) state_.recent.erase(state_.recent.begin());
-					}
+void WiFiDemodulator::processPart(std::span<const std::complex<int16_t>> samples, uint64_t segment, Snapshot& batch)
+{
+    synchronizer_.append(samples);
+    for (auto event : detector_.process(samples))
+    {
+        synchronizer_.candidate(event);
+        event.segment = segment;
+        batch.recent.push_back(event);
+    }
 
-					// обработка lltf событий
-					for (auto event : synced)
-					{
-						++state_.synchronized_packets;
-						state_.recent_sync.push_back(event);
-						if (state_.recent_sync.size() > 8)
-							state_.recent_sync.erase(state_.recent_sync.begin());
-					}
+    auto synced = synchronizer_.process(segment, batch.rejected_candidates);
+    for (const auto& event : synced)
+    {
+        if (!event.lsig_result.valid)
+            continue;
 
-					// обработка ht-sig событий
-					for (const auto& event : htsig_events)
-					{
-						++state_.decoded_ht_sig;
-						state_.recent_ht.push_back(event);
+        const auto rate = event.lsig_result.rate_mbps;
+        const auto length = event.lsig_result.length_bytes;
+        // The duration-matched HT-mixed L-SIG uses 6 Mb/s and a length
+        // divisible by 3. Legacy packets can also have these fields.
+        const bool could_be_ht = rate == 6 && length >= 9 && length % 3 == 0;
+        packets_.push_back({event.segment, event.packet_start_index, event.ltf_first_index,
+                            event.total_cfo_hz, length, {WifiPhyFormat::LegacyOfdm, rate, length},
+                            could_be_ht ? PacketStage::IdentifyFormat : PacketStage::Data});
+    }
+    batch.recent_sync.insert(batch.recent_sync.end(), std::make_move_iterator(synced.begin()),
+                             std::make_move_iterator(synced.end()));
 
-						if (state_.recent_ht.size() > 8)
-							state_.recent_ht.erase(state_.recent_ht.begin());
-					}
-				}
-			}
-			catch (const std::exception& e) 
-			{
-				std::lock_guard lock(mutex_);
-				state_.error = e.what();
-				state_.enabled = false;
-			}
-			generation = current;
-			segment = block.segment;
-			next = block.first + block.samples.size();
-		}
-	}
+    auto earliest = synchronizer_.endIndex();
+    for (auto packet = packets_.begin(); packet != packets_.end();)
+    {
+        if (advancePacket(*packet, batch))
+            packet = packets_.erase(packet);
+        else
+        {
+            earliest = std::min(earliest, packet->ltf_first_index);
+            ++packet;
+        }
+    }
+    synchronizer_.discardBefore(earliest);
+}
+
+bool WiFiDemodulator::advancePacket(PendingPacket& packet, Snapshot& batch)
+{
+    const auto iq = synchronizer_.samplesFrom(packet.ltf_first_index);
+    if (packet.stage == PacketStage::IdentifyFormat)
+    {
+        if (iq.size() < wifi::legacy_data_start + wifi::symbol_samples)
+            return false;
+        const auto axis = htsig_decoder_.firstSymbolAxis(iq, packet.cfo);
+        if (axis == OfdmSignalAxis::Unclear)
+        {
+            diagnose(packet, "Cannot classify OFDM format from the first symbol after L-SIG", batch);
+            return true;
+        }
+        packet.stage = axis == OfdmSignalAxis::Quadrature ? PacketStage::HtSignal : PacketStage::Data;
+    }
+
+    if (packet.stage == PacketStage::HtSignal)
+    {
+        if (iq.size() < wifi::ht_stf_start)
+            return false;
+        auto sig = htsig_decoder_.decode(iq, packet.cfo);
+        if (sig.valid)
+            ++batch.decoded_ht_sig;
+        batch.recent_ht.push_back({packet.segment, packet.ltf_first_index, sig});
+        if (!sig.supported_siso_ht20)
+        {
+            diagnose(packet, sig.error, batch);
+            return true;
+        }
+        packet.data = {WifiPhyFormat::HtMixed, sig.mcs, sig.length_bytes, sig.short_gi};
+        packet.aggregated = sig.aggregation;
+        packet.stage = PacketStage::Data;
+    }
+
+    const auto samples_needed = WifiDataDecoder::sampleCount(packet.data);
+    if (!samples_needed)
+    {
+        diagnose(packet, "Invalid OFDM PSDU length or DATA parameters", batch);
+        return true;
+    }
+    if (packet.data.format == WifiPhyFormat::HtMixed)
+    {
+        // HT duration from the end of L-SIG is rounded up to 4 us. Checking
+        // it against L-SIG also bounds how long the packet can retain IQ.
+        const auto duration = *samples_needed - wifi::legacy_data_start;
+        const auto symbols = (duration + wifi::symbol_samples - 1) / wifi::symbol_samples;
+        if (packet.lsig_length != 3 * (symbols - 1))
+        {
+            diagnose(packet, "HT-SIG DATA duration disagrees with L-SIG length", batch);
+            return true;
+        }
+    }
+    if (iq.size() < *samples_needed)
+        return false;
+
+    const auto decoded = data_decoder_.decode(iq.first(*samples_needed), packet.cfo, packet.data);
+    if (!decoded.error.empty())
+        diagnose(packet, decoded.error, batch);
+    else if (!packet.aggregated)
+        parseMpdu(packet, decoded.psdu, batch);
+    else
+    {
+        const auto ampdu = splitHtAmpdu(decoded.psdu);
+        for (const auto mpdu : ampdu.mpdus)
+            parseMpdu(packet, mpdu, batch);
+        if (!ampdu.error.empty())
+            diagnose(packet, ampdu.error, batch);
+        else if (ampdu.mpdus.empty())
+            diagnose(packet, "HT A-MPDU contains no MPDUs", batch);
+    }
+
+    return true;
+}
+
+void WiFiDemodulator::parseMpdu(const PendingPacket& packet, std::span<const uint8_t> mpdu, Snapshot& batch)
+{
+    auto parsed = MacFrameParser::parse(mpdu);
+    if (!parsed.frame)
+    {
+        diagnose(packet, parsed.error, batch);
+        return;
+    }
+
+    ++batch.verified_frames;
+    batch.recent_frames.push_back({packet.segment, packet.sample_index, packet.data.format,
+                                   packet.data.rate_or_mcs, std::move(*parsed.frame)});
+}
+
+void WiFiDemodulator::publish(Snapshot& batch)
+{
+    state_.processed_samples += batch.processed_samples;
+    state_.resets += batch.resets;
+    state_.candidates += batch.recent.size();
+    state_.synchronized_packets += batch.recent_sync.size();
+    state_.rejected_candidates += batch.rejected_candidates;
+    state_.decoded_ht_sig += batch.decoded_ht_sig;
+    state_.verified_frames += batch.verified_frames;
+    appendHistory(state_.recent, batch.recent);
+    appendHistory(state_.recent_sync, batch.recent_sync);
+    appendHistory(state_.recent_ht, batch.recent_ht);
+    appendHistory(state_.recent_frames, batch.recent_frames, frame_history_limit);
+    appendHistory(state_.recent_diagnostics, batch.recent_diagnostics);
+}
+
+void WiFiDemodulator::diagnose(const PendingPacket& packet, std::string_view message, Snapshot& batch)
+{
+    batch.recent_diagnostics.push_back({packet.segment, packet.sample_index, std::string(message)});
 }
