@@ -187,6 +187,7 @@ void USRPDevice::GetWiFiData(std::vector<float>& output_data, std::atomic_bool& 
 		}
 		});
 
+	++stream_segment;
 	uint64_t first = 0;
 	uint64_t last_drops = 0;
 	uint64_t last_overflows = 0;

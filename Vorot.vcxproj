@@ -116,6 +116,10 @@
     <ClCompile Include="Source\RealTimeViewer.cpp" />
     <ClCompile Include="Source\ReaTimeFFT.cpp" />
     <ClCompile Include="Source\USRPDevice.cpp" />
+    <ClCompile Include="Source\MacFrameParser.cpp" />
+    <ClCompile Include="Source\WifiBcc.cpp" />
+    <ClCompile Include="Source\WifiDataDecoder.cpp" />
+    <ClCompile Include="Source\WifiOfdm.cpp" />
     <ClCompile Include="Source\WiFiDemodulator.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -132,6 +136,10 @@
     <ClInclude Include="Source\RealTimeViewer.h" />
     <ClInclude Include="Source\ReaTimeFFT.h" />
     <ClInclude Include="Source\USRPDevice.h" />
+    <ClInclude Include="Source\MacFrameParser.h" />
+    <ClInclude Include="Source\WifiBcc.h" />
+    <ClInclude Include="Source\WifiDataDecoder.h" />
+    <ClInclude Include="Source\WifiOfdm.h" />
     <ClInclude Include="Source\WiFiDemodulator.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

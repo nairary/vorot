@@ -1,5 +1,85 @@
 #include "Application.h"
 
+namespace {
+
+void showMacAddress(const std::optional<MacAddress>& address)
+{
+    if (address)
+        ImGui::TextUnformatted(formatMacAddress(*address).c_str());
+    else
+        ImGui::TextDisabled("-");
+}
+
+void showWifiFrames(const WiFiDemodulator::Snapshot& wifi)
+{
+    ImGui::Text("Verified MPDUs: %llu", static_cast<unsigned long long>(wifi.verified_frames));
+    if (!wifi.error.empty())
+        ImGui::TextWrapped("%s", wifi.error.c_str());
+    if (!wifi.recent_diagnostics.empty())
+    {
+        const auto& diagnostic = wifi.recent_diagnostics.back();
+        ImGui::TextWrapped("Segment %llu, sample %llu: %s",
+            static_cast<unsigned long long>(diagnostic.segment),
+            static_cast<unsigned long long>(diagnostic.sample_index), diagnostic.message.c_str());
+    }
+
+    if (wifi.recent_frames.empty())
+        return;
+    constexpr auto flags = ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY |
+                           ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg |
+                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable |
+                           ImGuiTableFlags_Hideable;
+    if (!ImGui::BeginTable("Verified Wi-Fi frames", 11, flags, ImVec2(0, 230)))
+        return;
+    ImGui::TableSetupScrollFreeze(1, 1);
+    ImGui::TableSetupColumn("Segment / sample");
+    ImGui::TableSetupColumn("PHY");
+    ImGui::TableSetupColumn("Rate / MCS");
+    ImGui::TableSetupColumn("Source (SA)");
+    ImGui::TableSetupColumn("Destination (DA)");
+    ImGui::TableSetupColumn("BSSID");
+    ImGui::TableSetupColumn("Receiver (RA)");
+    ImGui::TableSetupColumn("Transmitter (TA)");
+    ImGui::TableSetupColumn("Type / subtype");
+    ImGui::TableSetupColumn("Bytes");
+    ImGui::TableSetupColumn("FCS");
+    ImGui::TableHeadersRow();
+
+    for (auto it = wifi.recent_frames.rbegin(); it != wifi.recent_frames.rend(); ++it)
+    {
+        const auto& packet = *it;
+        const auto& mac = packet.mac;
+        const bool legacy = packet.format == WifiPhyFormat::LegacyOfdm;
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("%llu / %llu", static_cast<unsigned long long>(packet.segment),
+            static_cast<unsigned long long>(packet.sample_index));
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(legacy ? "Legacy OFDM" : "HT20");
+        ImGui::TableNextColumn();
+        ImGui::Text(legacy ? "%u Mb/s" : "MCS %u", packet.rate_or_mcs);
+        ImGui::TableNextColumn();
+        showMacAddress(mac.source);
+        ImGui::TableNextColumn();
+        showMacAddress(mac.destination);
+        ImGui::TableNextColumn();
+        showMacAddress(mac.bssid);
+        ImGui::TableNextColumn();
+        showMacAddress(mac.receiver);
+        ImGui::TableNextColumn();
+        showMacAddress(mac.transmitter);
+        ImGui::TableNextColumn();
+        ImGui::Text("%s / %s", macFrameTypeName(mac.type), macFrameSubtypeName(mac.type, mac.subtype));
+        ImGui::TableNextColumn();
+        ImGui::Text("%zu", mac.length_bytes);
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted("Valid");
+    }
+    ImGui::EndTable();
+}
+
+}
+
 Application::Application(const int width, const int height)
     : io(ImGuiIO{})
 {
@@ -202,11 +282,13 @@ void Application::ShowUSRPInterface()
             bool enabled = wifi.enabled;
             const bool supported = std::abs(usrp_device->GetSamplingRate() * 1e6 - 20e6) <= 20;
             ImGui::Checkbox("Turn on Wi-Fi detection", &wifi_receive_mode);
-            ImGui::SeparatorText("Wi-Fi L-STF detection");
+            ImGui::SeparatorText("Wi-Fi reception");
             ImGui::BeginDisabled(!supported);
             if (ImGui::Checkbox("Enable Wi-Fi detection", &enabled)) usrp_device->WiFiEnable(enabled);
             ImGui::EndDisabled();
             if (!supported) ImGui::TextDisabled("Requires actual RX rate of 20 MS/s");
+            if (wifi_receive_mode)
+                ImGui::TextDisabled("DSSS/CCK rates (1, 2, 5.5, 11 Mb/s) are unsupported");
 
 
             if (!usrp_device->IsStreaming())
@@ -266,54 +348,42 @@ void Application::ShowUSRPInterface()
                     app_threads.pop_back();
                 }
 
-                // ещё одна wifi часть
-                if (!wifi.recent.empty()) {
+                if (!wifi.recent.empty())
+                {
                     const auto& last = wifi.recent.back();
-                    ImGui::Text("Latest score %.3f; coarse CFO %.1f Hz", last.correlation, last.cfo_hz);
+                    ImGui::Text("Latest L-STF score %.3f; coarse CFO %.1f Hz", last.correlation, last.cfo_hz);
                 }
-                ImGui::Text("L-LTF confirmed: %llu; rejected: %llu", static_cast<unsigned long long>(wifi.synchronized_packets), static_cast<unsigned long long>(wifi.rejected_candidates));
-                if (!wifi.recent_sync.empty()) 
+                ImGui::Text("L-LTF confirmed: %llu; rejected: %llu",
+                    static_cast<unsigned long long>(wifi.synchronized_packets),
+                    static_cast<unsigned long long>(wifi.rejected_candidates));
+                if (!wifi.recent_sync.empty())
                 {
                     const auto& sync = wifi.recent_sync.back();
-                    ImGui::Text("LTF1: %llu; inferred start: %llu; total CFO: %.1f Hz", static_cast<unsigned long long>(sync.ltf_first_index), static_cast<unsigned long long>(sync.packet_start_index), sync.total_cfo_hz);
-                    
+                    ImGui::Text("LTF1: %llu; inferred start: %llu; total CFO: %.1f Hz",
+                        static_cast<unsigned long long>(sync.ltf_first_index),
+                        static_cast<unsigned long long>(sync.packet_start_index), sync.total_cfo_hz);
                     if (sync.lsig_result.valid)
-                    {
-                        ImGui::Text("L-SIG decoded successfully");
-                        ImGui::Text("RATE: %u Mbps",
-                            sync.lsig_result.rate_mbps);
-                        ImGui::Text("LENGTH: %u",
-                            sync.lsig_result.length_bytes);
-                    }
+                        ImGui::Text("L-SIG: %u Mb/s, LENGTH %u (%s)", sync.lsig_result.rate_mbps,
+                            sync.lsig_result.length_bytes, sync.lsig_result.channel_parameters.c_str());
                     else
-                    {
-                        ImGui::Text("L-SIG decoding failed: %s",
-                            sync.lsig_result.error.c_str());
-                        ImGui::Text("");
-                        ImGui::Text("");
-                    }
-
-                        ImGui::Text("Parameters of wi-fi channel");
-                        ImGui::Text(sync.lsig_result.channel_parameters.c_str());
-
-                        if (!wifi.recent_ht.empty())
-                        {
-                            const auto& htsig_event = wifi.recent_ht.back();
-                            ImGui::Text("Info from HT_SIG");
-                            ImGui::Text("MCS: %u", static_cast<unsigned>(htsig_event.signal.mcs));
-                            if (htsig_event.signal.cbw40)
-                                ImGui::Text("Real bandwidth 40 MS/s");
-                            else
-                                ImGui::Text("Real bandwidth 20 MS/s");
-
-                            ImGui::Text("Length in bytes: %u", htsig_event.signal.length_bytes);
-
-                        }
-                    //}
+                        ImGui::Text("L-SIG: %s", sync.lsig_result.error.c_str());
                 }
-
-                
+                if (!wifi.recent_ht.empty())
+                {
+                    const auto& event = wifi.recent_ht.back();
+                    const auto& signal = event.signal;
+                    if (signal.valid)
+                        ImGui::Text("HT-SIG at LTF1 %llu: MCS %u, %u MHz, LENGTH %u",
+                            static_cast<unsigned long long>(event.ltf_first_index),
+                            signal.mcs, signal.cbw40 ? 40u : 20u, signal.length_bytes);
+                    else
+                        ImGui::Text("HT-SIG at LTF1 %llu: %s",
+                            static_cast<unsigned long long>(event.ltf_first_index), signal.error.c_str());
+                }
             }
+
+            if (wifi_receive_mode || wifi.enabled || !wifi.recent_frames.empty() || !wifi.error.empty())
+                showWifiFrames(wifi);
         }
     }
     ImGui::End();
